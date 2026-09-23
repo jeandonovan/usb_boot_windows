@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""USB Boot Windows - Windows 10/11 USB creator."""
+"""USB Boot Windows - vérification et création de supports Windows 10/11."""
 from __future__ import annotations
 import ctypes, json, os, subprocess, threading, time, webbrowser
 import tkinter as tk
@@ -12,6 +12,12 @@ CATALOG = [
     {"name": "Windows 10 22H2 - ISO officielle", "version": "Windows 10", "url": "https://www.microsoft.com/software-download/windows10ISO"},
 ]
 LANGUAGES = ["Français (France)", "English (United States)", "Deutsch (Deutschland)", "Español (España)", "Italiano (Italia)"]
+BOOT_MODES = [
+    "UEFI + MBR (compatible)",
+    "MBR uniquement (BIOS)",
+    "Legacy uniquement (BIOS ancien)",
+    "UEFI uniquement (GPT)",
+]
 
 
 def is_admin():
@@ -44,10 +50,14 @@ def size_text(value):
     return "?"
 
 
+def ps_quote(value):
+    return str(value).replace("'", "''")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_TITLE); self.geometry("950x650"); self.minsize(820, 560)
+        self.title(APP_TITLE); self.geometry("980x700"); self.minsize(860, 600)
         self.disk_rows = []; self.usb_rows = []; self.download_rows = []
         self.build_ui(); self.refresh_disks()
 
@@ -65,27 +75,34 @@ class App(tk.Tk):
     def make_detect_tab(self):
         top = ttk.Frame(self.tab_detect); top.pack(fill="x")
         ttk.Button(top, text="Actualiser", command=self.refresh_disks).pack(side="left")
-        ttk.Label(top, text="Le disque système est protégé.").pack(side="left", padx=12)
+        ttk.Label(top, text="Le disque système est protégé. Sélectionnez une clé USB avant l'analyse.").pack(side="left", padx=12)
         cols = ("num", "name", "bus", "size", "style", "status", "boot")
-        self.disk_tree = ttk.Treeview(self.tab_detect, columns=cols, show="headings", height=15)
+        self.disk_tree = ttk.Treeview(self.tab_detect, columns=cols, show="headings", height=14)
         labels = {"num":"N°", "name":"Nom", "bus":"Bus", "size":"Taille", "style":"Partition", "status":"État", "boot":"Système"}
         for c in cols: self.disk_tree.heading(c, text=labels[c]); self.disk_tree.column(c, width=120 if c != "name" else 230)
-        self.disk_tree.pack(fill="both", expand=True, pady=12)
-        self.detect_result = tk.StringVar(value="Sélectionnez une clé puis cliquez sur Analyser.")
-        ttk.Label(self.tab_detect, textvariable=self.detect_result, wraplength=850).pack(anchor="w")
-        ttk.Button(self.tab_detect, text="Analyser la clé sélectionnée", command=self.analyze).pack(anchor="e", pady=8)
+        self.disk_tree.pack(fill="both", expand=True, pady=10)
+        self.detect_result = tk.StringVar(value="Sélectionnez une clé puis cliquez sur Vérifier.")
+        ttk.Label(self.tab_detect, textvariable=self.detect_result, wraplength=900).pack(anchor="w")
+        buttons = ttk.Frame(self.tab_detect); buttons.pack(fill="x", pady=8)
+        ttk.Button(buttons, text="Vérifier si bootable", command=self.analyze).pack(side="left")
+        ttk.Button(buttons, text="Vérifier et rendre bootable…", command=self.verify_and_repair).pack(side="right")
+        ttk.Label(self.tab_detect, text="Pour réparer une clé, l'ISO Windows et le mode choisi dans l'onglet Rendre bootable sont utilisés.", foreground="#555").pack(anchor="w")
 
     def make_boot_tab(self):
-        ttk.Label(self.tab_boot, text="Création USB UEFI (TOUTES les données seront effacées)", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        row = ttk.Frame(self.tab_boot); row.pack(fill="x", pady=12)
+        ttk.Label(self.tab_boot, text="Création USB Windows (TOUTES les données seront effacées)", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        row = ttk.Frame(self.tab_boot); row.pack(fill="x", pady=10)
         ttk.Label(row, text="Clé USB :").pack(side="left")
-        self.boot_disk = ttk.Combobox(row, state="readonly", width=70); self.boot_disk.pack(side="left", padx=8)
+        self.boot_disk = ttk.Combobox(row, state="readonly", width=65); self.boot_disk.pack(side="left", padx=8)
         ttk.Button(row, text="Actualiser", command=self.refresh_disks).pack(side="left")
+        mode_row = ttk.Frame(self.tab_boot); mode_row.pack(fill="x", pady=4)
+        ttk.Label(mode_row, text="Mode de démarrage :").pack(side="left")
+        self.boot_mode = ttk.Combobox(mode_row, values=BOOT_MODES, state="readonly", width=35); self.boot_mode.current(0); self.boot_mode.pack(side="left", padx=8)
+        ttk.Label(mode_row, text="UEFI + MBR est le choix recommandé.", foreground="#555").pack(side="left")
         iso_row = ttk.Frame(self.tab_boot); iso_row.pack(fill="x", pady=4)
         ttk.Label(iso_row, text="ISO Windows :").pack(side="left")
         self.iso_entry = ttk.Entry(iso_row); self.iso_entry.pack(side="left", fill="x", expand=True, padx=8)
         ttk.Button(iso_row, text="Parcourir…", command=self.browse_iso).pack(side="left")
-        ttk.Button(self.tab_boot, text="Rendre bootable et copier l'ISO", command=self.make_bootable).pack(anchor="e", pady=14)
+        ttk.Button(self.tab_boot, text="Rendre bootable et copier l'ISO", command=self.make_bootable).pack(anchor="e", pady=12)
         self.boot_log = tk.Text(self.tab_boot, height=18, state="disabled", background="#111", foreground="#eee"); self.boot_log.pack(fill="both", expand=True)
 
     def make_download_tab(self):
@@ -118,21 +135,55 @@ class App(tk.Tk):
         if idx < 0 or idx >= len(self.usb_rows): raise ValueError("Aucune clé USB sélectionnée. Cliquez sur Actualiser.")
         return self.usb_rows[idx]
 
-    def analyze(self):
+    def selected_tree_disk_number(self):
         sel = self.disk_tree.selection()
-        if not sel: return
-        num = self.disk_tree.item(sel[0], "values")[0]
+        if not sel: raise ValueError("Sélectionnez une clé USB dans la liste.")
+        return int(self.disk_tree.item(sel[0], "values")[0])
+
+    @staticmethod
+    def disk_volumes(num):
+        raw = ps(f"Get-Partition -DiskNumber {num} | Get-Volume | Select DriveLetter,FileSystemLabel | ConvertTo-Json -Compress")
+        if not raw: return []
+        value = json.loads(raw); return value if isinstance(value, list) else [value]
+
+    def boot_report(self, num):
+        """Retourne les capacités réellement observées sur les fichiers de la clé."""
+        disk = next((d for d in self.disk_rows if int(d.get("Number", -1)) == num), {})
+        style = str(disk.get("PartitionStyle", ""))
+        found = []; efi = bios = False
+        for volume in self.disk_volumes(num):
+            letter = volume.get("DriveLetter")
+            if not letter: continue
+            root = f"{letter}:\\"
+            has_efi = os.path.exists(root + "efi\\boot\\bootx64.efi")
+            has_bootmgr = os.path.exists(root + "bootmgr")
+            has_source = os.path.exists(root + "sources\\install.wim") or os.path.exists(root + "sources\\install.esd")
+            if has_efi: efi = True
+            if has_bootmgr: bios = True
+            if has_efi or has_bootmgr or has_source:
+                found.append(f"{root} (EFI={'oui' if has_efi else 'non'}, BIOS={'oui' if has_bootmgr else 'non'})")
+        modes = []
+        if efi and style in ("GPT", "MBR"): modes.append("UEFI")
+        if bios and style == "MBR": modes.append("BIOS/Legacy")
+        return style, modes, found
+
+    def analyze(self):
         try:
-            raw = ps(f"Get-Partition -DiskNumber {int(num)} | Get-Volume | Select DriveLetter | ConvertTo-Json -Compress")
-            parts = json.loads(raw) if raw else []; parts = parts if isinstance(parts, list) else [parts]
-            found = []
-            for p in parts:
-                letter = p.get("DriveLetter")
-                if letter:
-                    root = f"{letter}:\\"
-                    if any(os.path.exists(root + x) for x in ("bootmgr", "efi\\boot\\bootx64.efi", "sources\\install.wim", "sources\\install.esd")): found.append(root)
-            self.detect_result.set("Bootable probable : " + ", ".join(found) if found else "Aucun fichier de démarrage détecté.")
+            num = self.selected_tree_disk_number(); style, modes, found = self.boot_report(num)
+            if modes: self.detect_result.set(f"Bootable : {', '.join(modes)} | Partition : {style} | " + "; ".join(found))
+            else: self.detect_result.set(f"NON bootable (partition {style}). Aucun ensemble EFI/BIOS Windows complet détecté.")
         except Exception as e: self.detect_result.set("Analyse impossible : " + str(e))
+
+    def verify_and_repair(self):
+        try:
+            num = self.selected_tree_disk_number(); style, modes, found = self.boot_report(num)
+            if modes:
+                messagebox.showinfo("Clé bootable", f"Cette clé semble bootable en : {', '.join(modes)}.\n\n{'; '.join(found)}")
+                return
+            if not messagebox.askyesno("Clé non bootable", "Aucun démarrage Windows complet n'a été détecté.\n\nVoulez-vous effacer cette clé et la recréer avec le mode choisi dans l'onglet Rendre bootable ?"): return
+            self.boot_disk.set(next((f"Disque {d.get('Number')} — {d.get('FriendlyName','')} — {size_text(d.get('Size'))}" for d in self.usb_rows if int(d.get('Number')) == num), ""))
+            self.make_bootable()
+        except Exception as e: messagebox.showerror("Vérification", str(e))
 
     def search_downloads(self):
         self.download_list.delete(0, tk.END); self.download_rows = [x for x in CATALOG if x["version"] == self.version.get()]
@@ -158,7 +209,7 @@ class App(tk.Tk):
         iso = self.iso_entry.get().strip()
         if not os.path.isfile(iso): return messagebox.showerror("ISO", "Sélectionnez une image ISO existante.")
         if not messagebox.askyesno("Confirmation", f"Le disque {num} ({size_text(d.get('Size'))}) sera EFFACÉ. Continuer ?"): return
-        threading.Thread(target=self.worker_boot, args=(num, iso), daemon=True).start()
+        threading.Thread(target=self.worker_boot, args=(num, iso, self.boot_mode.get()), daemon=True).start()
 
     @staticmethod
     def drive_for_disk(num):
@@ -166,40 +217,53 @@ class App(tk.Tk):
         letters = [x.strip() for x in raw.splitlines() if x.strip()]
         return (letters[0] + ":\\") if letters else None
 
-    def worker_boot(self, num, iso):
+    def worker_boot(self, num, iso, mode):
         mounted = False
         try:
-            self.log(f"Initialisation du disque {num}…")
-            script = f"select disk {num}\nclean\nconvert gpt\ncreate partition primary\nformat fs=fat32 quick label=WINUSB\nassign\nexit\n"
+            self.log(f"Initialisation du disque {num} en mode : {mode}")
+            if mode == "UEFI uniquement (GPT)":
+                partitioning, filesystem = "convert gpt", "fat32"
+            elif mode == "UEFI + MBR (compatible)":
+                partitioning, filesystem = "convert mbr", "fat32"
+            else:
+                partitioning, filesystem = "convert mbr", "ntfs"
+            script = f"select disk {num}\nclean\n{partitioning}\ncreate partition primary\nformat fs={filesystem} quick label=WINUSB\nactive\nassign\nexit\n"
             result = subprocess.run(["diskpart.exe"], input=script, text=True, capture_output=True, encoding="cp850", errors="replace")
             if result.returncode != 0: raise RuntimeError(result.stdout + "\n" + result.stderr)
-            self.log("Attribution automatique d'une lettre…")
             destination = None
             for _ in range(10):
                 destination = self.drive_for_disk(num)
                 if destination: break
                 time.sleep(1)
-            if not destination: raise RuntimeError("La clé a été formatée mais Windows ne lui a pas attribué de lettre. Ouvrez Gestion des disques et attribuez-en une, puis réessayez.")
+            if not destination: raise RuntimeError("La clé a été formatée mais Windows ne lui a pas attribué de lettre.")
             self.log(f"Destination détectée : {destination}")
-            self.log("Montage de l'ISO…")
-            safe = iso.replace("'", "''")
-            ps(f"Mount-DiskImage -ImagePath '{safe}' -StorageType ISO")
-            mounted = True; source = None
+            safe = ps_quote(iso); self.log("Montage de l'ISO…")
+            ps(f"Mount-DiskImage -ImagePath '{safe}' -StorageType ISO"); mounted = True
+            source = None
             for _ in range(15):
                 raw = ps(f"Get-DiskImage -ImagePath '{safe}' | Get-Volume | Select -Expand DriveLetter")
                 letters = [x.strip() for x in raw.splitlines() if x.strip()]
                 if letters: source = letters[0] + ":\\"; break
                 time.sleep(1)
             if not source: raise RuntimeError("Impossible de trouver la lettre de lecteur de l'ISO montée.")
+            if filesystem == "fat32" and os.path.exists(source + "sources\\install.wim") and os.path.getsize(source + "sources\\install.wim") > 4 * 1024**3:
+                self.log("AVERTISSEMENT : install.wim dépasse 4 Go, FAT32 peut refuser ce fichier.")
             self.log(f"Copie de {source} vers {destination}…")
             r = subprocess.run(["robocopy", source, destination, "/E", "/R:2", "/W:2", "/NFL", "/NDL"], capture_output=True, text=True, encoding="cp850", errors="replace")
             if r.returncode > 7: raise RuntimeError(r.stdout[-1500:])
-            self.log("Terminé : la clé est prête."); self.after(0, lambda: messagebox.showinfo("Terminé", "La clé USB a été créée."))
+            if mode in ("MBR uniquement (BIOS)", "Legacy uniquement (BIOS ancien)", "UEFI + MBR (compatible)"):
+                bootsect = source + "boot\\bootsect.exe"
+                if os.path.exists(bootsect):
+                    self.log("Installation du code de démarrage BIOS/MBR…")
+                    b = subprocess.run([bootsect, "/nt60", destination, "/mbr"], capture_output=True, text=True, encoding="cp850", errors="replace")
+                    if b.returncode != 0: raise RuntimeError(b.stdout + b.stderr)
+                else: self.log("bootsect.exe absent : les fichiers EFI/BIOS ont été copiés, mais le code BIOS n'a pas été installé.")
+            self.log("Terminé : la clé est prête."); self.after(0, lambda: messagebox.showinfo("Terminé", f"Clé créée en mode : {mode}"))
         except Exception as e:
             self.log("ERREUR : " + str(e)); self.after(0, lambda: messagebox.showerror("Échec", str(e)))
         finally:
             if mounted:
-                try: ps(f"Dismount-DiskImage -ImagePath '{iso.replace(chr(39), chr(39)*2)}'")
+                try: ps(f"Dismount-DiskImage -ImagePath '{ps_quote(iso)}'")
                 except Exception: pass
 
 if __name__ == "__main__":
